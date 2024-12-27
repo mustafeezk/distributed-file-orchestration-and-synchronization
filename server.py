@@ -4,21 +4,40 @@ import signal
 import sys
 import os
 import json
+import time
 from pathlib import Path
-from typing import Dict, Union, Any
+from typing import Dict, Union, Any, List
 
-# Signal handler for graceful shutdown
-def signal_handler(sig: int, frame: Any) -> None:
-    print("\n[SERVER SHUTDOWN] Signal received, closing server socket...")
-    server_socket.close()
-    sys.exit(0)
+# Global variables for connection management
+active_connections: List[socket.socket] = []
+connections_lock = threading.Lock()
 
-# Attach the signal handler to SIGINT
-signal.signal(signal.SIGINT, signal_handler)
-
+# Constants
 SERVER_STORAGE = Path("server_storage")
 CHUNK_SIZE = 4096
 EOF_MARKER = b"<<EOF>>"
+
+def cleanup_connections():
+    """Cleanup all active connections"""
+    with connections_lock:
+        for client_socket in active_connections:
+            try:
+                # Send shutdown message to client and wait briefly
+                shutdown_msg = json.dumps({"status": "shutdown", "message": "Server is shutting down"})
+                client_socket.send(shutdown_msg.encode('utf-8'))
+                time.sleep(0.1)  # Give clients time to receive the message
+                client_socket.close()
+            except:
+                pass
+        active_connections.clear()
+
+def signal_handler(sig: int, frame: Any) -> None:
+    """Handle shutdown signal"""
+    print("\n[SERVER SHUTDOWN] Signal received, closing all connections...")
+    cleanup_connections()
+    print("[SERVER SHUTDOWN] All connections closed")
+    server_socket.close()
+    sys.exit(0)
 
 def ensure_user_directory(username: str) -> Path:
     """Create user directory if it doesn't exist"""
@@ -42,24 +61,53 @@ def authenticate_user(credentials: Dict[str, str]) -> bool:
 def handle_upload(client_socket: socket.socket, user_dir: Path, filename: str) -> Dict[str, str]:
     """Handle file upload from client"""
     try:
+        # Send initial success response
+        success_response = {"status": "success", "message": "Ready for file transfer"}
+        client_socket.send(json.dumps(success_response).encode('utf-8'))
+        
         file_path = user_dir / filename
         with open(file_path, 'wb') as f:
             while True:
                 chunk = client_socket.recv(CHUNK_SIZE)
+                if not chunk:
+                    return {"status": "error", "message": "Connection lost during transfer"}
                 if chunk.endswith(EOF_MARKER):
                     f.write(chunk[:-len(EOF_MARKER)])  # Remove EOF marker
                     break
                 f.write(chunk)
         return {"status": "success", "message": f"File {filename} uploaded successfully"}
     except Exception as e:
+        # Clean up partial file if there's an error
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except:
+            pass
         return {"status": "error", "message": str(e)}
 
 def handle_download(client_socket: socket.socket, user_dir: Path, filename: str) -> Dict[str, str]:
     """Handle file download request"""
     try:
         file_path = user_dir / filename
+        
+        # First check if file exists in user's directory
         if not file_path.exists():
-            return {"status": "error", "message": "File not found"}
+            error_response = {"status": "error", "message": "File not found in your directory"}
+            client_socket.send(json.dumps(error_response).encode('utf-8'))
+            return error_response
+            
+        # Check if the file is actually within the user's directory (security check)
+        if not str(file_path.resolve()).startswith(str(user_dir.resolve())):
+            error_response = {"status": "error", "message": "Access denied: You can only access files in your directory"}
+            client_socket.send(json.dumps(error_response).encode('utf-8'))
+            return error_response
+        
+        # Send success response first
+        success_response = {"status": "success", "message": "Starting file transfer"}
+        client_socket.send(json.dumps(success_response).encode('utf-8'))
+        
+        # Small delay to ensure response is received before file data
+        time.sleep(0.1)
         
         with open(file_path, 'rb') as f:
             while True:
@@ -70,7 +118,12 @@ def handle_download(client_socket: socket.socket, user_dir: Path, filename: str)
                 client_socket.send(chunk)
         return {"status": "success", "message": "File sent successfully"}
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        error_response = {"status": "error", "message": str(e)}
+        try:
+            client_socket.send(json.dumps(error_response).encode('utf-8'))
+        except:
+            pass
+        return error_response
 
 def handle_preview(user_dir: Path, filename: str) -> Dict[str, str]:
     """Preview first 1024 bytes of a file"""
@@ -78,7 +131,11 @@ def handle_preview(user_dir: Path, filename: str) -> Dict[str, str]:
         file_path = user_dir / filename
         if not file_path.exists():
             return {"status": "error", "message": "File not found"}
-        
+            
+        # Security check
+        if not str(file_path.resolve()).startswith(str(user_dir.resolve())):
+            return {"status": "error", "message": "Access denied"}
+
         with open(file_path, 'rb') as f:
             preview = f.read(1024)
         return {"status": "success", "preview": preview.decode('utf-8', errors='ignore')}
@@ -91,6 +148,10 @@ def handle_delete(user_dir: Path, filename: str) -> Dict[str, str]:
         file_path = user_dir / filename
         if not file_path.exists():
             return {"status": "error", "message": "File not found"}
+            
+        # Security check
+        if not str(file_path.resolve()).startswith(str(user_dir.resolve())):
+            return {"status": "error", "message": "Access denied"}
         
         os.remove(file_path)
         return {"status": "success", "message": f"File {filename} deleted successfully"}
@@ -106,7 +167,12 @@ def list_files(user_dir: Path) -> Dict[str, Union[str, list]]:
         return {"status": "error", "message": str(e)}
 
 def handle_client(client_socket: socket.socket, addr: tuple) -> None:
+    """Handle individual client connection"""
     print(f"[NEW CONNECTION] {addr} connected.")
+    
+    # Add connection to active connections list
+    with connections_lock:
+        active_connections.append(client_socket)
     
     try:
         # Initial handshake
@@ -128,6 +194,7 @@ def handle_client(client_socket: socket.socket, addr: tuple) -> None:
 
         user_dir = ensure_user_directory(credentials["username"])
         client_socket.send(json.dumps({"status": "success", "message": "Authentication successful"}).encode('utf-8'))
+        print(f"User {credentials['username']} authenticated successfully")
 
         # Handle commands
         while True:
@@ -141,18 +208,24 @@ def handle_client(client_socket: socket.socket, addr: tuple) -> None:
 
                 if command["action"] == "upload":
                     response = handle_upload(client_socket, user_dir, command["filename"])
+                    print(f"Upload request from {credentials['username']}: {response['status']}")
                 elif command["action"] == "download":
                     response = handle_download(client_socket, user_dir, command["filename"])
+                    print(f"Download request from {credentials['username']}: {response['status']}")
                 elif command["action"] == "preview":
                     response = handle_preview(user_dir, command["filename"])
                 elif command["action"] == "delete":
                     response = handle_delete(user_dir, command["filename"])
+                    print(f"Delete request from {credentials['username']}: {response['status']}")
                 elif command["action"] == "list":
                     response = list_files(user_dir)
                 elif command["action"] == "exit":
+                    print(f"User {credentials['username']} requested exit")
                     break
 
-                client_socket.send(json.dumps(response).encode('utf-8'))
+                # Only send response for non-file-transfer operations
+                if command["action"] not in ["upload", "download"]:
+                    client_socket.send(json.dumps(response).encode('utf-8'))
 
             except json.JSONDecodeError:
                 print(f"[ERROR] Invalid JSON from client {addr}")
@@ -161,28 +234,57 @@ def handle_client(client_socket: socket.socket, addr: tuple) -> None:
                 print(f"[ERROR] {e}")
                 break
 
+    except Exception as e:
+        print(f"[ERROR] {e}")
     finally:
-        client_socket.close()
+        # Remove connection from active connections list
+        with connections_lock:
+            if client_socket in active_connections:
+                active_connections.remove(client_socket)
+        try:
+            client_socket.close()
+        except:
+            pass
         print(f"[DISCONNECTED] {addr} disconnected.")
 
 def start_server() -> None:
+    """Start the server and listen for connections"""
     global server_socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind(('0.0.0.0', 12345))
-    server_socket.listen(5)  # Explicitly set backlog for Python 3.6+ compatibility
-    print("[SERVER STARTED] Listening on port 12345")
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    
+    try:
+        server_socket.bind(('0.0.0.0', 12345))
+        server_socket.listen(5)
+        print("[SERVER STARTED] Listening on port 12345")
 
-    # Create server storage directory if it doesn't exist
-    SERVER_STORAGE.mkdir(exist_ok=True)
+        # Create server storage directory if it doesn't exist
+        SERVER_STORAGE.mkdir(exist_ok=True)
 
-    while True:
+        while True:
+            try:
+                client_socket, addr = server_socket.accept()
+                client_thread = threading.Thread(target=handle_client, args=(client_socket, addr))
+                client_thread.daemon = True  # Set thread as daemon
+                client_thread.start()
+                print(f"[ACTIVE CONNECTIONS] {threading.active_count() - 1}")
+            except OSError:
+                # Server socket was closed
+                break
+            except Exception as e:
+                print(f"[ERROR] Accept failed: {e}")
+                continue
+
+    except Exception as e:
+        print(f"[ERROR] Server failed to start: {e}")
+    finally:
+        cleanup_connections()
         try:
-            client_socket, addr = server_socket.accept()
-            client_thread = threading.Thread(target=handle_client, args=(client_socket, addr))
-            client_thread.start()
-            print(f"[ACTIVE CONNECTIONS] {threading.active_count() - 1}")
-        except OSError:
-            break
+            server_socket.close()
+        except:
+            pass
 
 if __name__ == "__main__":
+    # Set up signal handler
+    signal.signal(signal.SIGINT, signal_handler)
     start_server()
